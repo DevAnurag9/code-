@@ -1,0 +1,413 @@
+Colab Cell 0 — Imports & setup
+# Cell 0: imports and basic setup
+# No special installs required for Colab (numpy, matplotlib, pandas already available).
+
+import random                         # random sampling for placing walls/victims/agents
+import heapq                          # priority queue used by A*
+from collections import deque         # deque used by BFS
+import matplotlib.pyplot as plt       # plotting library
+import matplotlib.animation as animation  # for animated demo
+import numpy as np                    # grid handling arrays
+import pandas as pd                   # metrics display
+from IPython.display import HTML, display  # display animation inline
+
+# reproducibility: set seeds (change to get different random mazes)
+random.seed(42)
+np.random.seed(42)
+
+Colab Cell 1 — Parameters (tweak here)
+# Cell 1: Parameters you can change for experiments / demo
+
+GRID_ROWS = 25                  # maze height
+GRID_COLS = 25                  # maze width
+WALL_DENSITY = 0.28             # fraction of cells that are walls (0..0.45 recommended)
+NUM_AGENTS = 3                  # number of rescue agents
+NUM_VICTIMS = 8                 # initial number of trapped victims to rescue
+AGENT_STARTS = None             # None -> place randomly; or supply list of (r,c) tuples length NUM_AGENTS
+VISUALIZE = True                # whether to show static panels
+MAKE_ANIMATION = True           # whether to create inline animation
+RANDOM_PLACEMENT = True         # if False use deterministic placement (for reproducible demo)
+RETURN_TO_BASE_AFTER_RESCUE = False  # if True, agents return to their start after rescuing victim
+
+# derived
+total_cells = GRID_ROWS * GRID_COLS
+
+Colab Cell 2 — Maze generation, place agents & victims
+# Cell 2: Create maze grid (0 = free, 1 = wall), and place agents + victims
+
+# create grid of zeros (free cells)
+grid = np.zeros((GRID_ROWS, GRID_COLS), dtype=int)
+
+# randomly choose wall cells based on WALL_DENSITY, but ensure the start area remains reachable
+num_walls = int(total_cells * WALL_DENSITY)
+
+# generate list of all positions
+all_positions = [(r, c) for r in range(GRID_ROWS) for c in range(GRID_COLS)]
+
+# helper to place randomly while avoiding adjacency pitfalls: we'll ensure start + some clearance
+def random_positions(k, forbidden=set()):
+    """Return k random positions from all_positions excluding any in forbidden."""
+    choices = [p for p in all_positions if p not in forbidden]
+    return random.sample(choices, k)
+
+# reserve a small clear area (center) to reduce fully-blocked mazes
+reserved = set()
+center = (GRID_ROWS // 2, GRID_COLS // 2)
+# reserve a 3x3 around center to reduce fragmentation
+for dr in (-1,0,1):
+    for dc in (-1,0,1):
+        rr, cc = center[0]+dr, center[1]+dc
+        if 0 <= rr < GRID_ROWS and 0 <= cc < GRID_COLS:
+            reserved.add((rr, cc))
+
+# choose wall positions
+wall_candidates = [p for p in all_positions if p not in reserved]
+wall_positions = set(random.sample(wall_candidates, min(num_walls, len(wall_candidates))))
+
+# mark walls in grid as 1
+for (r,c) in wall_positions:
+    grid[r,c] = 1
+
+# place agents
+if AGENT_STARTS is None:
+    # choose starts from non-wall positions, keep them separated
+    free_positions = [p for p in all_positions if grid[p] == 0 and p not in reserved]
+    AGENT_STARTS = random_positions(NUM_AGENTS, forbidden=set())
+else:
+    # use supplied starts (validate not walls)
+    AGENT_STARTS = AGENT_STARTS[:NUM_AGENTS]
+
+# ensure starts are free (if randomly collided with wall, move them to free spots)
+for i in range(NUM_AGENTS):
+    r,c = AGENT_STARTS[i]
+    if grid[r,c] == 1:
+        # find a nearby free position
+        free_positions = [p for p in all_positions if grid[p] == 0 and p not in AGENT_STARTS]
+        AGENT_STARTS[i] = random.choice(free_positions)
+
+# place victims in free cells not occupied by agents, try to avoid putting them inside walls
+available_for_victims = [p for p in all_positions if grid[p] == 0 and p not in AGENT_STARTS]
+if RANDOM_PLACEMENT:
+    victim_positions = set(random.sample(available_for_victims, min(NUM_VICTIMS, len(available_for_victims))))
+else:
+    victim_positions = set(available_for_victims[:NUM_VICTIMS])
+
+# print small sanity info
+print("Grid size:", GRID_ROWS, "x", GRID_COLS)
+print("Walls:", len(wall_positions), "Victims:", len(victim_positions), "Agents:", len(AGENT_STARTS))
+print("Agent starts:", AGENT_STARTS)
+
+Colab Cell 3 — Utilities: neighbors, BFS exploration, A*
+# Cell 3: Utility functions: neighbors (grid), BFS for exploration & pathfinding, and A* (for shortest paths)
+
+def neighbors(cell):
+    """Yield 4-neighbors inside grid bounds that are not walls."""
+    r, c = cell
+    for dr, dc in ((1,0),(-1,0),(0,1),(0,-1)):
+        nr, nc = r+dr, c+dc
+        if 0 <= nr < GRID_ROWS and 0 <= nc < GRID_COLS and grid[nr,nc] == 0:
+            yield (nr, nc)
+
+def bfs_explore(start):
+    """
+    BFS from start to discover reachable free cells.
+    Returns:
+      - visited: set of reachable cells
+      - parents: dict mapping cell -> parent (for path recovery)
+    """
+    visited = set([start])
+    parents = {start: None}
+    q = deque([start])
+    while q:
+        cur = q.popleft()
+        for nb in neighbors(cur):
+            if nb not in visited:
+                visited.add(nb)
+                parents[nb] = cur
+                q.append(nb)
+    return visited, parents
+
+def reconstruct_path(parents, goal):
+    """Reconstruct path from parent dict returned by BFS (or A* parents) to goal."""
+    path = []
+    node = goal
+    while node is not None:
+        path.append(node)
+        node = parents.get(node, None)
+    path.reverse()
+    return path
+
+def manhattan(a, b):
+    """Manhattan distance heuristic for A*."""
+    return abs(a[0]-b[0]) + abs(a[1]-b[1])
+
+def astar(start, goal):
+    """
+    A* shortest path on grid avoiding walls (grid==1).
+    Returns list from start to goal inclusive, or None if unreachable.
+    """
+    if start == goal:
+        return [start]
+    open_heap = []
+    heapq.heappush(open_heap, (manhattan(start, goal), 0, start, None))
+    came_from = {}
+    gscore = {start: 0}
+    closed = set()
+    while open_heap:
+        f, g, current, parent = heapq.heappop(open_heap)
+        if current in closed:
+            continue
+        came_from[current] = parent
+        if current == goal:
+            return reconstruct_path(came_from, current)
+        closed.add(current)
+        for nb in neighbors(current):
+            tentative_g = g + 1
+            if nb in gscore and tentative_g >= gscore[nb]:
+                continue
+            gscore[nb] = tentative_g
+            heapq.heappush(open_heap, (tentative_g + manhattan(nb, goal), tentative_g, nb, current))
+    return None
+
+Colab Cell 4 — Exploration & reachability check
+# Cell 4: For each agent compute reachable area using BFS (so agents only consider reachable victims)
+
+agent_reachable = {}   # maps agent id -> set of reachable cells
+agent_parents = {}     # maps agent id -> parents dict from BFS (for path recovery when target reachable)
+
+for aid, start in enumerate(AGENT_STARTS):
+    if grid[start] == 1:
+        # if start is inside a wall for some reason, mark empty reachable set
+        agent_reachable[aid] = set()
+        agent_parents[aid] = {}
+    else:
+        visited, parents = bfs_explore(start)
+        agent_reachable[aid] = visited
+        agent_parents[aid] = parents
+    print(f"Agent {aid} reachable cells: {len(agent_reachable[aid])}")
+
+# Filter victims by reachability: only consider victims at cells free and reachable by at least one agent
+reachable_victims = set()
+for v in victim_positions:
+    for aid in agent_reachable:
+        if v in agent_reachable[aid]:
+            reachable_victims.add(v)
+            break
+
+print("Total victims placed:", len(victim_positions), "Reachable by at least one agent:", len(reachable_victims))
+
+Colab Cell 5 — Logic-based assignment of victims to agents
+# Cell 5: Assign each reachable victim to a specific agent using simple logic:
+# Assign victim to the nearest agent (by Manhattan distance) among agents that can reach it.
+# This yields disjoint assignments and matches the "logic-based assignment for rescue zones" hint.
+
+assignments = {aid: set() for aid in range(NUM_AGENTS)}  # empty assigned victim sets
+
+for v in reachable_victims:
+    # compute distance to each agent start among those who can reach v
+    candidates = []
+    for aid, start in enumerate(AGENT_STARTS):
+        if v in agent_reachable[aid]:            # only consider agents that can reach this victim
+            candidates.append((manhattan(v, start), aid))
+    if not candidates:
+        continue  # skip unreachable victim
+    # choose smallest manhattan distance (tie-break by lower agent id)
+    dist, chosen_aid = min(candidates)
+    assignments[chosen_aid].add(v)
+
+# print assignment summary
+for aid in assignments:
+    print(f"Agent {aid} assigned {len(assignments[aid])} victims")
+
+Colab Cell 6 — Plan per-agent rescue routes (A* between waypoints)
+# Cell 6: For each agent, produce an ordered rescue route:
+# We'll use greedy nearest-neighbor ordering among assigned victims (works well and cheap),
+# and use A* to compute exact grid paths between waypoints.
+
+def plan_route_for_agent(start, tasks):
+    """
+    Order tasks by greedy NN from start; then compute A* path segments connecting them.
+    Returns full_path and ordered list of tasks.
+    """
+    tasks = set(tasks)
+    order = []
+    cur = start
+    while tasks:
+        # choose nearest remaining task by Manhattan distance from current position
+        nearest = min(tasks, key=lambda t: manhattan(t, cur))
+        order.append(nearest)
+        tasks.remove(nearest)
+        cur = nearest
+    # connect with A*
+    waypoints = [start] + order
+    full_path = []
+    for i in range(len(waypoints) - 1):
+        seg = astar(waypoints[i], waypoints[i+1])
+        if seg is None:
+            # if any segment is unreachable (shouldn't happen because we used reachability), skip
+            raise RuntimeError(f"A* failed: {waypoints[i]} -> {waypoints[i+1]}")
+        if i == 0:
+            full_path.extend(seg)
+        else:
+            full_path.extend(seg[1:])  # avoid duplicate connecting node
+    return full_path, order
+
+plans = {}
+task_orders = {}
+for aid in range(NUM_AGENTS):
+    start = AGENT_STARTS[aid]
+    tasks = assignments[aid]
+    path, order = plan_route_for_agent(start, tasks)
+    plans[aid] = path
+    task_orders[aid] = order
+    print(f"Agent {aid} planned path length {len(path)}, tasks {len(order)}")
+
+Colab Cell 7 — Simulation: agents move, rescue, optionally return
+# Cell 7: Simulate agents moving along their planned paths one step per timestep.
+# When an agent reaches a victim cell, we mark that victim as rescued.
+# Optionally, after rescue they can return to base (controlled by RETURN_TO_BASE_AFTER_RESCUE).
+
+# agent positions start at their start locations
+agent_positions = {aid: AGENT_STARTS[aid] for aid in range(NUM_AGENTS)}
+rescued = set()                     # set of victims rescued
+positions_log = []                  # per-timestep agent positions
+rescued_log = []                    # per-timestep rescued set
+
+# precompute maximum path length to know how many timesteps to simulate initially
+max_len = max((len(plans[aid]) for aid in plans), default=0)
+
+# If RETURN_TO_BASE_AFTER_RESCUE: append path back to start after finishing tasks
+if RETURN_TO_BASE_AFTER_RESCUE:
+    for aid in range(NUM_AGENTS):
+        if len(task_orders[aid]) > 0:
+            last = task_orders[aid][-1]
+            back = astar(last, AGENT_STARTS[aid])
+            if back:
+                # skip duplicate node of last
+                plans[aid].extend(back[1:])
+    max_len = max((len(plans[aid]) for aid in plans), default=0)
+
+# simulate step-by-step
+for t in range(max_len):
+    step_pos = {}
+    for aid in range(NUM_AGENTS):
+        path = plans[aid]
+        if t < len(path):
+            agent_positions[aid] = path[t]   # move along planned path
+        step_pos[aid] = agent_positions[aid]
+        # if current cell contains a victim and hasn't been rescued, rescue it now
+        if agent_positions[aid] in victim_positions and agent_positions[aid] not in rescued:
+            rescued.add(agent_positions[aid])
+    positions_log.append(dict(step_pos))
+    rescued_log.append(set(rescued))
+
+# after simulation, compute metrics
+num_rescued = len(rescued)
+total_victims = len(victim_positions)
+makespan = max((len(plans[aid]) for aid in plans), default=0)
+total_steps = sum(len(plans[aid]) for aid in plans)
+efficiency = num_rescued / total_steps if total_steps > 0 else 0.0
+
+print("Simulation done. Rescued:", num_rescued, "out of", total_victims)
+
+Colab Cell 8 — Visualization: static 3-panel & metrics
+# Cell 8: Build visualization grids and display metrics
+# cell codes: 0 free, 1 wall, 2 victim initial, 3 rescued, 4 agent path overlay, 5 agent start
+
+def make_grid(show_paths=True, show_rescued=True):
+    """Return integer-coded grid for plotting."""
+    g = np.zeros((GRID_ROWS, GRID_COLS), dtype=int)
+    # walls
+    for (r,c) in wall_positions:
+        g[r,c] = 1
+    # victims initial (if not rescued)
+    for v in victim_positions:
+        if show_rescued and v in rescued:
+            g[v] = 3   # mark rescued differently
+        else:
+            g[v] = 2
+    # overlay planned paths optionally
+    if show_paths:
+        for aid in range(NUM_AGENTS):
+            for p in plans[aid]:
+                # don't overwrite walls or victims/rescued
+                if g[p] == 0:
+                    g[p] = 4
+    # mark starts
+    for aid, s in enumerate(AGENT_STARTS):
+        g[s] = 5
+    return g
+
+# static panels
+if VISUALIZE:
+    fig, axes = plt.subplots(1,3, figsize=(15,5))
+    axes[0].imshow(make_grid(show_paths=False, show_rescued=False))
+    axes[0].set_title("Initial: walls (1) & victims (2) & starts (5)")
+    axes[0].axis('off')
+
+    axes[1].imshow(make_grid(show_paths=True, show_rescued=False))
+    axes[1].set_title("Planned paths (4) over maze")
+    axes[1].axis('off')
+
+    axes[2].imshow(make_grid(show_paths=True, show_rescued=True))
+    axes[2].set_title("Final state: rescued=3")
+    axes[2].axis('off')
+
+    plt.tight_layout()
+    plt.show()
+
+# print metrics as DataFrame
+metrics = {
+    "grid": (GRID_ROWS, GRID_COLS),
+    "walls": len(wall_positions),
+    "victims_total": len(victim_positions),
+    "victims_rescued": num_rescued,
+    "makespan_steps": makespan,
+    "total_steps_traveled": total_steps,
+    "efficiency_rescued_per_step": efficiency
+}
+display(pd.DataFrame(list(metrics.items()), columns=["metric","value"]))
+
+Colab Cell 9 — Optional animation of rescue process
+# Cell 9: Optional animation showing agents moving and rescuing over time
+if MAKE_ANIMATION and len(positions_log) > 0:
+    base = np.zeros((GRID_ROWS, GRID_COLS), dtype=int)
+    for (r,c) in wall_positions:
+        base[r,c] = 1
+    for v in victim_positions:
+        base[v] = 2  # initial victim marker
+
+    fig, ax = plt.subplots(figsize=(6,6))
+    im = ax.imshow(base, vmin=0, vmax=6)
+    ax.axis('off')
+
+    def update(frame):
+        gridf = base.copy()
+        # mark rescued up to this frame
+        for v in rescued_log[frame]:
+            gridf[v] = 3
+        # mark agent positions at this frame
+        for aid in range(NUM_AGENTS):
+            pos = positions_log[frame][aid]
+            gridf[pos] = 5 + aid  # distinct agent markers (6,7,...)
+        im.set_data(gridf)
+        ax.set_title(f"Step {frame+1}/{len(positions_log)}  Rescued: {len(rescued_log[frame])}")
+        return (im,)
+
+    ani = animation.FuncAnimation(fig, update, frames=len(positions_log), interval=200, blit=False)
+    plt.close(fig)
+    display(HTML(ani.to_jshtml()))
+else:
+    print("Animation disabled or no steps to animate.")
+
+Colab Cell 10 — Route summaries (print for demo)
+# Cell 10: Print short route & assignment summaries to talk through in your demo
+print("--- ASSIGNMENTS ---")
+for aid in range(NUM_AGENTS):
+    print(f"Agent {aid} start {AGENT_STARTS[aid]} assigned {len(assignments[aid])} victims")
+    print("  visit order (first 8 shown):", task_orders[aid][:8])
+    print("  planned path length:", len(plans[aid]))
+    print()
+
+print("--- VICTIM LIST ---")
+print(sorted(victim_positions))

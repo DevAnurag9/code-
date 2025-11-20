@@ -1,0 +1,337 @@
+Colab Cell 0 — Install & imports
+
+Paste and run this first. It installs nothing special (we rely on standard libs) and imports everything used later.
+
+# Cell 0: imports and setup
+# No special packages required beyond numpy, matplotlib, pandas which are already available in Colab.
+# If missing, uncomment the pip installs below.
+
+# !pip install numpy matplotlib pandas    # usually not necessary in Colab
+
+import random         # used for random dirt placement
+import heapq          # priority queue for A* implementation
+import math           # numeric helpers (not strictly required but common)
+from collections import deque  # available if you switch to BFS later
+import matplotlib.pyplot as plt  # plotting / visualization
+import matplotlib.animation as animation  # for animation option
+import numpy as np    # numerical arrays, grid handling
+import pandas as pd   # pretty printing metrics tables
+from IPython.display import HTML, display  # to show animation inline in Colab
+
+# Set a reproducible seed for consistent results each run (change/remove if you want randomness)
+random.seed(42)
+np.random.seed(42)
+
+
+Colab Cell 1 — Parameters (tweak here)
+
+Make changes here for grid size, dirt density, agent starts, etc.
+
+# Cell 1: Parameters (change these to try different scenarios)
+GRID_ROWS = 20           # number of rows in grid
+GRID_COLS = 28           # number of cols in grid
+DIRT_PERCENT = 0.18      # fraction of cells that are dirty (0..1)
+AGENT_STARTS = [(2, 2), (17, 25)]  # tuple (row, col) for each agent start
+VISUALIZE = True         # show static visualization
+MAKE_ANIMATION = True    # create animation of agents moving (slower)
+RANDOMIZE_DIRT = True    # if True pick random dirty cells, else deterministic selection
+
+# Safety / derived parameters
+total_cells = GRID_ROWS * GRID_COLS
+num_dirty = max(1, int(total_cells * DIRT_PERCENT))  # count of dirty cells
+
+Colab Cell 2 — Build grid & dirty cells
+
+This cell creates the grid and the initial set of dirt positions.
+
+# Cell 2: Build grid and pick dirty cells
+# Create list of all grid positions
+all_positions = [(r, c) for r in range(GRID_ROWS) for c in range(GRID_COLS)]
+
+# Exclude agent start positions from becoming dirty initially
+available_positions = [p for p in all_positions if p not in AGENT_STARTS]
+
+# Pick dirty cells either randomly or deterministically (useful for debugging)
+if RANDOMIZE_DIRT:
+    dirty_cells = set(random.sample(available_positions, num_dirty))  # random unique sample
+else:
+    dirty_cells = set(available_positions[:num_dirty])  # deterministic pick
+
+# Quick sanity print
+print(f"Grid: {GRID_ROWS}x{GRID_COLS}, total cells={total_cells}, dirt cells={len(dirty_cells)}")
+print("Agent starts:", AGENT_STARTS)
+
+Colab Cell 3 — Utilities and A* pathfinder
+
+A complete A* implementation for 4-neighbor grid; neighbors, manhattan, and astar.
+
+# Cell 3: Utility functions and A* implementation
+
+def neighbors(cell):
+    """
+    Yield 4-neighbor cells (up/down/left/right) inside the grid.
+    cell: (row, col)
+    """
+    r, c = cell
+    for dr, dc in ((1,0),(-1,0),(0,1),(0,-1)):
+        nr, nc = r + dr, c + dc
+        if 0 <= nr < GRID_ROWS and 0 <= nc < GRID_COLS:
+            yield (nr, nc)
+
+def manhattan(a, b):
+    """Manhattan distance between two cells a and b."""
+    return abs(a[0] - b[0]) + abs(a[1] - b[1])
+
+def astar(start, goal, blocked=set()):
+    """
+    A* search on the grid from start to goal avoiding cells in `blocked`.
+    Returns list of cells from start to goal inclusive, or None if no path.
+    """
+    if start == goal:
+        return [start]
+    open_heap = []  # heap of tuples (f, g, node, parent)
+    # push start: f = h(start), g = 0, parent = None
+    heapq.heappush(open_heap, (manhattan(start, goal), 0, start, None))
+    came_from = {}  # node -> parent
+    gscore = {start: 0}
+    closed = set()
+
+    while open_heap:
+        f, g, current, parent = heapq.heappop(open_heap)
+        if current in closed:
+            continue
+        came_from[current] = parent
+        if current == goal:
+            # reconstruct path
+            path = []
+            node = current
+            while node is not None:
+                path.append(node)
+                node = came_from[node]
+            path.reverse()
+            return path
+        closed.add(current)
+        for nb in neighbors(current):
+            if nb in blocked:
+                continue
+            tentative_g = g + 1
+            if nb in gscore and tentative_g >= gscore[nb]:
+                continue
+            gscore[nb] = tentative_g
+            heapq.heappush(open_heap, (tentative_g + manhattan(nb, goal), tentative_g, nb, current))
+    return None
+
+Colab Cell 4 — Task assignment (Voronoi) & route planning per agent
+
+Partition tasks to agents based on nearest start (Manhattan), then order tasks via greedy NN and compute A* segments.
+
+# Cell 4: Task assignment (Voronoi) and planning per agent
+
+# 1) Voronoi partition: assign each dirty cell to the nearest agent start (tie -> agent 0)
+assignments = {0: set(), 1: set()}
+for d in dirty_cells:
+    d0 = manhattan(d, AGENT_STARTS[0])
+    d1 = manhattan(d, AGENT_STARTS[1])
+    if d0 <= d1:
+        assignments[0].add(d)
+    else:
+        assignments[1].add(d)
+
+# 2) Plan route for each agent
+def plan_route_for_agent(agent_id, start, tasks):
+    """
+    Given a set of tasks (cells), produce:
+      - order: greedy nearest-neighbor order of tasks (list)
+      - full_path: concatenated A* paths connecting start -> task1 -> task2 -> ...
+    """
+    tasks = set(tasks)
+    order = []
+    cur = start
+    # greedy nearest-neighbor order (cheap heuristic for TSP)
+    while tasks:
+        nearest = min(tasks, key=lambda t: manhattan(t, cur))
+        order.append(nearest)
+        tasks.remove(nearest)
+        cur = nearest
+    # connect waypoints with A*
+    waypoints = [start] + order
+    full_path = []
+    for i in range(len(waypoints) - 1):
+        seg = astar(waypoints[i], waypoints[i+1])
+        if seg is None:
+            raise RuntimeError(f"A* couldn't connect {waypoints[i]} -> {waypoints[i+1]}")
+        if i == 0:
+            full_path.extend(seg)       # keep starting node for first segment
+        else:
+            full_path.extend(seg[1:])   # skip duplicate connecting node for subsequent segments
+    return full_path, order
+
+# run planning for both agents
+plans = {}
+task_orders = {}
+for aid in (0,1):
+    p, order = plan_route_for_agent(aid, AGENT_STARTS[aid], assignments[aid])
+    plans[aid] = p
+    task_orders[aid] = order
+
+# quick summary
+print("Assigned tasks: agent0 =", len(assignments[0]), "agent1 =", len(assignments[1]))
+print("Planned path lengths: agent0 =", len(plans[0]), "agent1 =", len(plans[1]))
+
+Colab Cell 5 — Simulation (step-by-step)
+
+Simulate both agents moving one step per timestep along their planned paths and cleaning dirt when visited.
+
+# Cell 5: Simulate agents following their plans step-by-step
+
+max_len = max(len(plans[0]), len(plans[1]))  # simulate until slower agent finishes
+agent_positions = {0: AGENT_STARTS[0], 1: AGENT_STARTS[1]}
+cleaned = set()
+positions_log = []
+cleaned_log = []
+
+for t in range(max_len):
+    step_pos = {}
+    for aid in (0,1):
+        path = plans[aid]
+        if t < len(path):
+            agent_positions[aid] = path[t]  # move along path
+        # else stay at last position
+        step_pos[aid] = agent_positions[aid]
+        # cleaning: if current position was dirty, mark it cleaned
+        if agent_positions[aid] in dirty_cells:
+            cleaned.add(agent_positions[aid])
+    positions_log.append(dict(step_pos))    # record positions at this timestep
+    cleaned_log.append(set(cleaned))        # record which cells have been cleaned so far
+
+print("Simulation finished. Timesteps:", max_len)
+
+Colab Cell 6 — Metrics and static visualization (3-panel)
+
+Displays a 3-panel static figure: initial dirty map, planned paths overlay, final cleaned map. Also prints metrics.
+
+# Cell 6: Metrics and static visualization of results
+
+# compute metrics
+total_cleaned = len(cleaned)
+coverage = total_cleaned / len(dirty_cells) if dirty_cells else 1.0
+total_steps_traveled = sum(len(plans[aid]) for aid in plans)
+makespan = max(len(plans[0]), len(plans[1]))
+avg_path_len = total_steps_traveled / 2.0
+efficiency_score = (total_cleaned / total_steps_traveled) if total_steps_traveled > 0 else 0.0
+
+metrics = {
+    "grid_size": (GRID_ROWS, GRID_COLS),
+    "num_dirty": len(dirty_cells),
+    "dirty_assigned_agent0": len(assignments[0]),
+    "dirty_assigned_agent1": len(assignments[1]),
+    "total_cleaned": total_cleaned,
+    "coverage": coverage,
+    "total_steps_traveled": total_steps_traveled,
+    "makespan_time_steps": makespan,
+    "avg_path_length_per_agent": avg_path_len,
+    "efficiency_cleaned_per_step": efficiency_score
+}
+metrics_df = pd.DataFrame(list(metrics.items()), columns=["metric","value"])
+
+# helper to build numeric grid for plotting
+def make_grid_image(show_paths=True):
+    # codes: 0 empty, 1 initial dirty, 2 cleaned, 3 agent0 path, 4 agent1 path, 5 start0, 6 start1
+    base = np.zeros((GRID_ROWS, GRID_COLS), dtype=int)
+    for (r,c) in dirty_cells:
+        base[r,c] = 1
+    for (r,c) in cleaned:
+        base[r,c] = 2
+    if show_paths:
+        for aid in (0,1):
+            for p in plans[aid]:
+                if base[p] == 0:
+                    base[p] = 3 + aid
+        base[AGENT_STARTS[0]] = 5
+        base[AGENT_STARTS[1]] = 6
+    return base
+
+# plot panels
+if VISUALIZE:
+    fig, axes = plt.subplots(1,3, figsize=(15,5))
+    init_grid = np.zeros((GRID_ROWS, GRID_COLS), dtype=int)
+    for (r,c) in dirty_cells:
+        init_grid[r,c] = 1
+    init_grid[AGENT_STARTS[0]] = 5
+    init_grid[AGENT_STARTS[1]] = 6
+    axes[0].imshow(init_grid)
+    axes[0].set_title("Initial dirty cells + agent starts")
+    axes[0].axis('off')
+
+    path_grid = make_grid_image(show_paths=True)
+    axes[1].imshow(path_grid)
+    axes[1].set_title("Planned paths (agents) and tasks")
+    axes[1].axis('off')
+
+    final_grid = make_grid_image(show_paths=False)
+    axes[2].imshow(final_grid)
+    axes[2].set_title("Final cleaned cells (2 = cleaned)")
+    axes[2].axis('off')
+
+    plt.tight_layout()
+    plt.show()
+
+# print metrics
+print("\n--- METRICS ---")
+display(metrics_df)
+
+Colab Cell 7 — Optional: create an animation (animated cleaning)
+
+Animation is slower but great for a demo. It uses positions_log created during simulation. The cell will show an inline animation in Colab. If MAKE_ANIMATION=False skip this.
+
+# Cell 7: Optional animation of agent movement (set MAKE_ANIMATION True earlier)
+if MAKE_ANIMATION:
+    # build base grid with initial dirty cells (we won't change the base during animation,
+    # we overlay agent positions and cleaned markers per frame)
+    base = np.zeros((GRID_ROWS, GRID_COLS), dtype=int)
+    for (r,c) in dirty_cells:
+        base[r,c] = 1  # mark initial dirty
+
+    fig, ax = plt.subplots(figsize=(6,6))
+    im = ax.imshow(base, vmin=0, vmax=6)
+    ax.axis('off')
+
+    # colormap: let matplotlib choose default; for clarity we can overlay markers for agents
+    def update(frame):
+        # frame is index into positions_log and cleaned_log
+        grid = base.copy()
+        # mark cleaned cells up to this frame
+        for (r,c) in cleaned_log[frame]:
+            grid[r,c] = 2
+        # mark agent paths (optional): show where agent is right now
+        a0 = positions_log[frame][0]
+        a1 = positions_log[frame][1]
+        # place special values for agents (ensure distinct from other codes)
+        grid[a0] = 5
+        grid[a1] = 6
+        im.set_data(grid)
+        ax.set_title(f"Timestep {frame+1}/{len(positions_log)}")
+        return (im,)
+
+    ani = animation.FuncAnimation(fig, update, frames=len(positions_log), interval=100, blit=False)
+    plt.close(fig)  # avoid duplicate static output
+
+    # display inline
+    display(HTML(ani.to_jshtml()))
+else:
+    print("Animation skipped (MAKE_ANIMATION=False).")
+
+Colab Cell 8 — Route summaries (printed lists) — helpful for demo commentary
+
+This prints per-agent assigned tasks and planned path info. Use if you want to show route details.
+
+# Cell 8: Print detailed per-agent route summaries (useful to show judges)
+print("\n--- ROUTE SUMMARY ---")
+for aid in (0,1):
+    print(f"Agent {aid} start: {AGENT_STARTS[aid]}")
+    print(f"  assigned_tasks ({len(assignments[aid])}): {sorted(assignments[aid])}")
+    print(f"  planned_path_length: {len(plans[aid])}")
+    print(f"  visit_order (first 10 shown): {task_orders[aid][:10]}{'...' if len(task_orders[aid])>10 else ''}")
+    print()
+
+print("--- End of summary ---")
