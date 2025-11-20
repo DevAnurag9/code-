@@ -1,0 +1,394 @@
+Colab Cell 0 — Imports & setup
+# Cell 0: imports and reproducible setup
+# Standard libraries: numpy, matplotlib, pandas are available in Colab.
+import random
+import heapq
+import math
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.animation as animation
+from collections import deque
+import pandas as pd
+from IPython.display import HTML, display
+
+# set seed for reproducibility (change or remove for different random maps)
+random.seed(42)
+np.random.seed(42)
+
+Colab Cell 1 — Parameters (tweak here)
+# Cell 1: parameters - change these to experiment
+GRID_ROWS = 24              # grid height
+GRID_COLS = 28              # grid width
+NUM_AGENTS = 4              # number of agents collecting resources
+NUM_RESOURCES = 40          # number of scattered resources
+AGENT_STARTS = None         # None -> random starts (will place NUM_AGENTS); or provide list of tuples
+OBSTACLE_DENSITY = 0.08     # fraction of blocked / obstacle cells
+RANDOMIZE = True            # randomize positions or deterministic
+VISUALIZE = True            # show static visualizations
+MAKE_ANIMATION = True       # show animation of agents collecting resources
+USE_SHARED_QUEUE = True     # agents pull tasks from a shared queue (centralized)
+DECISION_STRATEGY = "bid"   # "nearest" or "bid" (bid = distributed decision via cost/bid)
+# Bid strategy: each agent computes cost (distance) to resource and proposes bid = 1/(cost+1). Highest bid wins.
+
+Colab Cell 2 — Build map: obstacles, resources, agents
+# Cell 2: build grid, obstacles, resource positions, and agent starts
+
+rows, cols = GRID_ROWS, GRID_COLS
+all_positions = [(r, c) for r in range(rows) for c in range(cols)]  # all grid coordinates
+
+# Place obstacles (no-go cells) randomly avoiding edges to reduce isolation
+num_obstacles = int(rows * cols * OBSTACLE_DENSITY)
+if RANDOMIZE:
+    obstacle_candidates = all_positions.copy()
+    obstacles = set(random.sample(obstacle_candidates, min(num_obstacles, len(obstacle_candidates))))
+else:
+    # deterministic obstacles: take some spaced cells
+    obstacles = set(all_positions[::max(1, len(all_positions)//max(1, num_obstacles))][:num_obstacles])
+
+# Ensure obstacles do not block everything: we will still check reachability later
+
+# Pick resource locations (avoid obstacles)
+available_for_resources = [p for p in all_positions if p not in obstacles]
+if RANDOMIZE:
+    resources = set(random.sample(available_for_resources, min(NUM_RESOURCES, len(available_for_resources))))
+else:
+    resources = set(available_for_resources[:NUM_RESOURCES])
+
+# Place agent starts: random free cells not overlapping resources or obstacles
+if AGENT_STARTS is None:
+    free_for_starts = [p for p in available_for_resources if p not in resources]
+    AGENT_STARTS = random.sample(free_for_starts, min(NUM_AGENTS, len(free_for_starts)))
+else:
+    # If user provided starts, ensure they are valid
+    AGENT_STARTS = AGENT_STARTS[:NUM_AGENTS]
+    # move any starts that are invalid into free positions
+    for i, s in enumerate(AGENT_STARTS):
+        if s in obstacles or s in resources:
+            candidates = [p for p in available_for_resources if p not in AGENT_STARTS and p not in resources]
+            AGENT_STARTS[i] = random.choice(candidates)
+
+# Print sanity info
+print(f"Grid {rows}x{cols}, obstacles: {len(obstacles)}, resources: {len(resources)}, agents: {len(AGENT_STARTS)}")
+print("Agent starts:", AGENT_STARTS)
+
+Colab Cell 3 — Utilities & A* pathfinder
+# Cell 3: helper functions - neighbors, manhattan, and A* that avoids obstacles
+
+def neighbors(cell):
+    """Yield 4-connected neighbors that are inside grid and not obstacle."""
+    r, c = cell
+    for dr, dc in ((1,0),(-1,0),(0,1),(0,-1)):
+        nr, nc = r + dr, c + dc
+        if 0 <= nr < rows and 0 <= nc < cols and (nr, nc) not in obstacles:
+            yield (nr, nc)
+
+def manhattan(a, b):
+    """Manhattan distance between two cells (used as heuristic)."""
+    return abs(a[0] - b[0]) + abs(a[1] - b[1])
+
+def astar(start, goal):
+    """
+    A* pathfinding: returns list of cells from start to goal (inclusive) or None if unreachable.
+    Uses Manhattan heuristic and avoids obstacles via neighbors().
+    """
+    if start == goal:
+        return [start]
+    open_heap = []
+    # heap entries: (f, g, cell, parent)
+    heapq.heappush(open_heap, (manhattan(start, goal), 0, start, None))
+    came_from = {}
+    gscore = {start: 0}
+    closed = set()
+    while open_heap:
+        f, g, current, parent = heapq.heappop(open_heap)
+        if current in closed:
+            continue
+        came_from[current] = parent
+        if current == goal:
+            # reconstruct path
+            path = []
+            node = current
+            while node is not None:
+                path.append(node)
+                node = came_from[node]
+            path.reverse()
+            return path
+        closed.add(current)
+        for nb in neighbors(current):
+            tentative_g = g + 1
+            if nb in gscore and tentative_g >= gscore[nb]:
+                continue
+            gscore[nb] = tentative_g
+            heapq.heappush(open_heap, (tentative_g + manhattan(nb, goal), tentative_g, nb, current))
+    return None  # unreachable
+
+Colab Cell 4 — Shared task queue + decision logic
+# Cell 4: Build shared task queue (list of resource locations) and implement decision strategies.
+# We simulate a centralized queue that agents consult each time they need a new target.
+# If DECISION_STRATEGY == "nearest": agent picks nearest resource from the queue when ready.
+# If DECISION_STRATEGY == "bid": all agents compute bids (1/(distance+1)) and the highest bidder wins per resource.
+# Here we implement a simple distributed bidding per-selection: agents propose for top-K resources and we resolve.
+
+# Initialize shared queue as a list (we'll remove resources as assigned/collected)
+shared_queue = list(resources)  # resources are coordinates
+
+# Function: agent computes cost to a resource (use A* distance if reachable else large)
+def cost_to(agent_pos, resource_pos):
+    """Return steps (A* path length - 1) if reachable, else a large number."""
+    p = astar(agent_pos, resource_pos)
+    if p is None:
+        return 10**6  # unreachable
+    return len(p) - 1
+
+# Distributed decision: when an agent is idle, it will choose a resource based on strategy.
+# We will ensure no two agents pick same resource simultaneously by centralized lock in this simulation loop.
+
+# Helper: pick next target for a given agent
+def pick_next_target(agent_id, agent_pos, queue):
+    """
+    Decide next resource for agent_id using chosen decision strategy.
+    queue: current list of available resources (not yet assigned or collected)
+    Returns: chosen resource or None if none available/reachable.
+    """
+    if not queue:
+        return None
+    # compute cost to all queue resources
+    costs = [cost_to(agent_pos, r) for r in queue]
+    # if all unreachable, return None
+    if min(costs) >= 10**6:
+        return None
+    if DECISION_STRATEGY == "nearest":
+        # choose resource with minimal cost (nearest)
+        j = int(np.argmin(costs))
+        return queue[j]
+    elif DECISION_STRATEGY == "bid":
+        # Simplified bidding: each agent will propose for the resource that gives highest bid = 1/(cost+1).
+        # But to avoid global synchronization complexity, we'll choose the resource where this agent's advantage is highest:
+        # compute for each resource: difference between this agent's cost and average cost of other agents.
+        # prefer resources where agent has strong advantage (others are far away).
+        # This makes targets partition naturally among agents.
+        # Compute other agents' costs if needed
+        # Build advantage score = (mean_other_cost - my_cost)
+        other_agent_indices = [i for i in range(NUM_AGENTS) if i != agent_id]
+        avg_other_costs = []
+        for k, r in enumerate(queue):
+            other_costs = []
+            for oa in other_agent_indices:
+                # Assume other agents are at current positions (we'll pass agent positions list externally)
+                other_costs.append(cost_to(current_positions[oa], r))
+            avg_other = np.mean(other_costs) if other_costs else 10**6
+            avg_other_costs.append(avg_other)
+        adv = [avg_other_costs[k] - costs[k] for k in range(len(queue))]
+        # choose resource with maximal advantage (tie break by minimal my cost)
+        best_idx = int(np.argmax(adv))
+        return queue[best_idx]
+    else:
+        # default fallback to nearest
+        j = int(np.argmin(costs))
+        return queue[j]
+
+Colab Cell 5 — Per-agent planning & simulation loop
+# Cell 5: Simulation orchestration:
+# - Each agent maintains current position, planned path (list of cells), inventory (collected count)
+# - When an agent's planned path is exhausted, it requests next target from shared queue using pick_next_target()
+# - Central simulation steps all agents one cell per timestep, updates collected resources, and logs positions
+
+# Initialize agent state
+current_positions = {aid: AGENT_STARTS[aid] for aid in range(NUM_AGENTS)}  # current coords
+planned_paths = {aid: [] for aid in range(NUM_AGENTS)}  # list of future positions (including current move)
+collected = {aid: 0 for aid in range(NUM_AGENTS)}  # number of resources collected per agent
+collection_log = []   # per-timestep log of collected counts
+positions_log = []    # per-timestep positions of all agents
+assigned_resources = {}  # mapping resource -> agent id currently assigned (to avoid double-assign)
+
+# central queue is mutable list 'shared_queue'
+# We'll keep it consistent: when a resource is assigned to an agent, we temporarily mark it in assigned_resources
+# and remove it from shared_queue. If planning fails (unreachable), we put back.
+
+# simulation parameters
+MAX_STEPS = rows * cols * 4  # an upper bound to avoid infinite runs
+step = 0
+
+# Helper: assign and plan for an agent (called when agent idle)
+def assign_and_plan_for_agent(aid):
+    """Assign next resource using pick_next_target and compute A* path to it (store in planned_paths)."""
+    # Use current_positions global
+    target = pick_next_target(aid, current_positions[aid], shared_queue)
+    if target is None:
+        return False  # no feasible target now
+    # tentatively remove from shared queue and mark assigned
+    try:
+        shared_queue.remove(target)
+    except ValueError:
+        # someone else grabbed it
+        return False
+    assigned_resources[target] = aid
+    # compute path
+    p = astar(current_positions[aid], target)
+    if p is None:
+        # unreachable despite earlier checks; unassign and restore queue
+        assigned_resources.pop(target, None)
+        shared_queue.append(target)
+        return False
+    # store planned path (full path including current cell as first)
+    planned_paths[aid] = p
+    return True
+
+# initial assignment: try to give each agent a first target
+for aid in range(NUM_AGENTS):
+    assign_and_plan_for_agent(aid)
+
+# simulation main loop
+while (any(planned_paths[aid] for aid in range(NUM_AGENTS)) or shared_queue) and step < MAX_STEPS:
+    # move each agent one step along its planned path if available
+    for aid in range(NUM_AGENTS):
+        path = planned_paths[aid]
+        if path:
+            # path[0] might be current position; advance by using index step_pos
+            # find index of current position in planned path if present
+            try:
+                idx = path.index(current_positions[aid])
+            except ValueError:
+                idx = -1
+            # move to next cell if exists
+            if idx + 1 < len(path):
+                current_positions[aid] = path[idx + 1]
+            else:
+                # agent already at final node of path (just arrived)
+                current_positions[aid] = path[-1]
+                # clear path so we will assign new target next iteration
+                planned_paths[aid] = []
+        else:
+            # agent has no plan -> try to assign
+            assigned = assign_and_plan_for_agent(aid)
+            # if we successfully assigned, next loop they'll start moving along the path
+
+    # after moving all agents for this timestep, check if any agent is on resource and collect
+    to_unassign = []
+    for r in list(assigned_resources.keys()):
+        aid = assigned_resources[r]
+        if current_positions[aid] == r:
+            # collect resource
+            collected[aid] += 1
+            # remove from assigned_resources
+            to_unassign.append(r)
+    for r in to_unassign:
+        assigned_resources.pop(r, None)
+        # resource is collected so it should not be returned to queue
+
+    # also, if an agent happens to step on an unassigned resource (not pre-assigned), collect it
+    # (this handles opportunistic collection)
+    for aid in range(NUM_AGENTS):
+        pos = current_positions[aid]
+        if pos in resources and pos not in assigned_resources:
+            # collect it and remove from queue if present
+            if pos in shared_queue:
+                try:
+                    shared_queue.remove(pos)
+                except ValueError:
+                    pass
+            collected[aid] += 1
+            # also if pos is in assigned resources mapped to someone else (race), remove mapping
+            assigned_resources.pop(pos, None)
+            # If this agent had planned path to a different target, keep it (opportunistic)
+
+    # try to assign new tasks greedily for agents that are idle (no planned path)
+    for aid in range(NUM_AGENTS):
+        if not planned_paths[aid]:
+            assign_and_plan_for_agent(aid)
+
+    # record logs
+    positions_log.append({aid: current_positions[aid] for aid in range(NUM_AGENTS)})
+    collection_log.append({aid: collected[aid] for aid in range(NUM_AGENTS)})
+
+    # stop early if all resources collected
+    total_collected = sum(collected.values())
+    if total_collected >= len(resources):
+        break
+
+    step += 1
+
+print("Simulation finished in steps:", step+1)
+print("Collected per agent:", collected)
+
+Colab Cell 6 — Metrics & bar plot (resources collected by each agent)
+# Cell 6: compute / display metrics and show a bar plot of resources per agent
+
+total_collected = sum(collected.values())
+metrics = {
+    "grid_size": (rows, cols),
+    "num_resources_initial": len(resources),
+    "num_obstacles": len(obstacles),
+    "num_agents": NUM_AGENTS,
+    "total_collected": total_collected,
+    "steps_taken": step + 1,
+    "collected_per_agent": collected
+}
+
+# display basic metrics
+display(pd.DataFrame(list(metrics.items()), columns=["metric","value"]))
+
+# bar plot: resources collected by each agent
+if VISUALIZE:
+    agents = list(range(NUM_AGENTS))
+    counts = [collected[a] for a in agents]
+    plt.figure(figsize=(8,4))
+    plt.bar([f"Agent {a}" for a in agents], counts)
+    plt.title("Resources collected per agent")
+    plt.ylabel("Count")
+    plt.show()
+
+Colab Cell 7 — Static map visualization (resources, obstacles, agent paths)
+# Cell 7: static visualization of map and final agent positions
+if VISUALIZE:
+    # build map grid for plotting codes:
+    # 0 = free, 1 = obstacle, 2 = resource (if still left), 3+ = agent positions
+    grid_vis = np.zeros((rows, cols), dtype=int)
+    for o in obstacles:
+        grid_vis[o] = 1
+    # remaining uncollected resources (should be zero or very small)
+    remaining_resources = [r for r in resources if r not in sum(([tuple(p) for p in []], []))]
+    for r in resources:
+        # mark all original resources as 2 (even if collected, we'll mark collected spots later)
+        grid_vis[r] = 2
+    # mark agent final positions
+    for aid in range(NUM_AGENTS):
+        pos = current_positions[aid]
+        grid_vis[pos] = 4 + aid  # codes 4,5,6,...
+
+    plt.figure(figsize=(8,10))
+    plt.imshow(grid_vis)
+    plt.title("Map: obstacles (1), resources (2), agents (4+)")
+    plt.axis('off')
+    plt.show()
+
+Colab Cell 8 — Optional animation of agents collecting resources
+# Cell 8: animate agent movement over time (positions_log) and show collection counts
+if MAKE_ANIMATION and positions_log:
+    base = np.zeros((rows, cols), dtype=int)
+    for o in obstacles:
+        base[o] = 1
+    for r in resources:
+        base[r] = 2  # initial resource marker
+
+    fig, ax = plt.subplots(figsize=(6,6))
+    im = ax.imshow(base, vmin=0, vmax=10)
+    ax.axis('off')
+
+    def update(frame):
+        gridf = base.copy()
+        # mark resources that have been collected up to this frame (check collection_log)
+        # we don't have explicit per-resource time, but we can mark positions of agents as they move
+        # We'll mark agent positions and reduce resource markers where an agent stands
+        for aid in range(NUM_AGENTS):
+            pos = positions_log[frame][aid]
+            gridf[pos] = 6 + aid  # agent colors
+        ax.set_title(f"Step {frame+1}/{len(positions_log)}  Collected so far: {sum(collection_log[frame].values())}")
+        im.set_data(gridf)
+        return (im,)
+
+    ani = animation.FuncAnimation(fig, update, frames=len(positions_log), interval=150, blit=False)
+    plt.close(fig)
+    display(HTML(ani.to_jshtml()))
+else:
+    print("Animation skipped or no positions logged.")
