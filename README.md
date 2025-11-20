@@ -336,3 +336,159 @@ Exploration
 Collision avoidance
 
 Performance evaluation
+
+PART 4 — RESOURCE COLLECTION TEAM
+
+“Multiple agents ek map me scattered resources collect karte hain shared task queue aur distributed logic ka use karke.”
+
+1️⃣ GRID / MAP KYA HAI?
+
+Ek 2D grid jisme:
+
+0 = free cells
+
+1 = obstacles
+
+2 = resource cells
+
+Agents randomly placed, obstacles randomly placed.
+
+2️⃣ RESOURCES — Scattered across map
+
+NUM_RESOURCES = 40
+
+Random free cells par place kiye jaate hain.
+
+Agents ko ye sab collect karne hote hain.
+
+3️⃣ AGENTS — Multi-agent system
+
+Example:
+NUM_AGENTS = 4
+
+Har agent ek unique position se start hota hai.
+
+4️⃣ CORE PROBLEM
+
+Agents ko duplicate kaam nahi karna hai:
+
+Same resource competitive do agents collect na karein
+
+Har resource exactly 1 agent should pick
+
+Solution: Shared Task Queue
+
+5️⃣ SHARED TASK QUEUE — Kaise kaam karta hai?
+⚡ Concept:
+
+Saare resources ek global list/queue me store hote hain.
+
+Jab agent free hota hai → woh queue me available resource choose karta hai.
+
+Jo resource assign ho gaya → queue se remove kar diya jata hai.
+
+Isse duplication avoid hota hai.
+
+6️⃣ DISTRIBUTED DECISION LOGIC
+
+Do simple strategies:
+
+A) Nearest Strategy
+
+Agent free hua → queue se nearest resource pick karega
+
+Cost = Manhattan distance
+
+Pros: Simple & fast
+Cons: Load balancing average
+
+B) Bid Strategy (distributed intelligent logic)
+
+Har agent ek “bid” calculate karta hai:
+
+bid = 1 / (distance + 1)
+
+Jis agent ka bid zyada → usko resource milta hai
+
+Yeh natural division create karta hai
+
+Agents un resources ko pick karte hain jinke liye unka advantage zyada hai
+
+Pros:
+
+Less conflict
+
+Load balancing better
+
+Smart behavior without central control
+
+7️⃣ PATH PLANNING — A* ka use har resource tak jaane ke liye
+
+Agent ko pick kiye hue resource tak shortest path A* de deta hai.
+
+A* obstacles avoid karta hai.
+
+8️⃣ OPPORTUNISTIC COLLECTION
+
+Agar agent kisi resource ke upar se randomly guzar jaaye:
+→ Wo turant collect kar leta hai (queue check kiye bina)
+
+Yeh real-world jaisa behavior produce karta hai.
+
+9️⃣ SIMULATION
+
+Har timestep:
+
+Agents move along A* path
+
+Agar resource cell hai → collect
+
+Collected resource queue se remove
+
+Agent free → new work assigned
+
+Logs update hote hain
+
+🔟 VISUALIZATION
+
+Outputs:
+
+1. Final Map:
+
+Obstacles (1)
+
+Original resources (2)
+
+Final agent positions (4+)
+
+2. Bar Plot:
+
+Har agent ne kitne resources collect kiye
+
+3. Animation:
+
+Step-by-step movement
+
+Live collection count
+
+Judges ko yeh bahut pasand aata hai.
+
+⭐ METRICS
+Metric	Meaning
+Total collected	kitne resources collect hue
+Steps taken	total simulation steps
+Per-agent collection	fairness measure
+Efficiency	collection rate per step
+⭐ EXTRA CONCEPTS
+
+Why shared queue?
+Duplicate work avoid hota hai.
+
+Why bid strategy?
+Better load-balancing milta hai.
+
+Why A?*
+Obstacle-aware shortest path.
+
+Why opportunistic pickup?
+Realistic multi-agent emergent behavior.
