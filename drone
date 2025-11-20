@@ -1,0 +1,373 @@
+Colab Cell 0 — Install & imports
+
+Paste and run this first (installs SciPy if you want Hungarian assignment).
+
+# Cell 0: setup & imports
+# If SciPy (for Hungarian) is missing in your Colab runtime, the install below will add it.
+# Usually SciPy is available in Colab; uncomment the pip line only if you get an import error.
+
+# !pip install scipy      # uncomment if scipy not present
+
+import random
+import heapq
+import math
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.animation as animation
+from collections import deque
+import pandas as pd
+from IPython.display import HTML, display
+
+# Optional Hungarian assignment from SciPy
+try:
+    from scipy.optimize import linear_sum_assignment
+    SCIPY_AVAILABLE = True
+except Exception:
+    SCIPY_AVAILABLE = False
+
+# reproducible seed
+random.seed(42)
+np.random.seed(42)
+
+Colab Cell 1 — Parameters (tweak these)
+
+Change grid size, drones start positions, number of packages, assignment method, obstacles, and visualization flags here.
+
+# Cell 1: parameters - tweak to test different scenarios
+GRID_ROWS = 30               # grid height
+GRID_COLS = 30               # grid width
+NUM_PACKAGES = 30            # number of delivery targets (locations)
+DRONE_STARTS = [(2, 2), (27, 27)]  # start positions for drone0 and drone1 (row,col)
+ASSIGNMENT_MODE = "hungarian" # "greedy" or "hungarian"
+USE_NO_FLY_ZONES = True      # enable grid obstacles / no-fly zones
+NO_FLY_DENSITY = 0.06        # fraction of cells blocked (if enabled)
+VISUALIZE = True             # static visualizations
+MAKE_ANIMATION = True        # animated deliveries
+RANDOMIZE_TARGETS = True     # random targets or deterministic placement
+
+Colab Cell 2 — Build grid, no-fly zones, and package targets
+
+This cell prepares the grid, random no-fly cells (optional), and package target locations.
+
+# Cell 2: create grid, no-fly zones, and package targets
+rows, cols = GRID_ROWS, GRID_COLS
+all_positions = [(r, c) for r in range(rows) for c in range(cols)]
+
+# Create blocked/no-fly set if enabled
+blocked = set()
+if USE_NO_FLY_ZONES:
+    num_blocked = int(rows * cols * NO_FLY_DENSITY)
+    # avoid blocking drone starts
+    available = [p for p in all_positions if p not in DRONE_STARTS]
+    blocked = set(random.sample(available, min(num_blocked, len(available))))
+
+# Generate package targets (avoid drone starts and blocked cells)
+available_for_targets = [p for p in all_positions if p not in DRONE_STARTS and p not in blocked]
+if RANDOMIZE_TARGETS:
+    targets = set(random.sample(available_for_targets, min(NUM_PACKAGES, len(available_for_targets))))
+else:
+    targets = set(available_for_targets[:NUM_PACKAGES])
+
+print(f"Grid: {rows}x{cols}, targets: {len(targets)}, blocked cells: {len(blocked)}")
+
+Colab Cell 3 — Utilities and A* pathfinder
+
+A* implementation for shortest path on the grid avoiding blocked cells. Manhattan heuristic.
+
+# Cell 3: utilities and A* implementation
+def neighbors(cell):
+    r, c = cell
+    for dr, dc in ((1,0),(-1,0),(0,1),(0,-1)):
+        nr, nc = r+dr, c+dc
+        if 0 <= nr < rows and 0 <= nc < cols and (nr, nc) not in blocked:
+            yield (nr, nc)
+
+def manhattan(a, b):
+    return abs(a[0]-b[0]) + abs(a[1]-b[1])
+
+def astar(start, goal):
+    """Return list of cells from start to goal inclusive, or None if unreachable."""
+    if start == goal:
+        return [start]
+    open_heap = []
+    heapq.heappush(open_heap, (manhattan(start, goal), 0, start, None))
+    came_from = {}
+    gscore = {start: 0}
+    closed = set()
+    while open_heap:
+        f, g, current, parent = heapq.heappop(open_heap)
+        if current in closed:
+            continue
+        came_from[current] = parent
+        if current == goal:
+            # reconstruct
+            path = []
+            node = current
+            while node is not None:
+                path.append(node)
+                node = came_from[node]
+            path.reverse()
+            return path
+        closed.add(current)
+        for nb in neighbors(current):
+            tentative = g + 1
+            if nb in gscore and tentative >= gscore[nb]:
+                continue
+            gscore[nb] = tentative
+            heapq.heappush(open_heap, (tentative + manhattan(nb, goal), tentative, nb, current))
+    return None
+
+Colab Cell 4 — Assignment: Greedy or Hungarian
+
+Create a cost matrix (Manhattan/A* cost) and assign each target to a drone. Hungarian minimizes total assignment cost. Greedy assigns each target to closest drone.
+
+# Cell 4: assignment of targets to drones
+
+drone_count = 2
+drones = DRONE_STARTS
+
+# first compute cost from each drone start to each target
+# cost can be Manhattan or actual path length (A*). We'll try A* first and fallback to Manhattan if unreachable.
+targets_list = list(targets)
+
+# compute A* distances (path lengths) from each drone to each target (None -> unreachable)
+cost_matrix = np.full((drone_count, len(targets_list)), fill_value=10**6, dtype=int)
+
+for i, start in enumerate(drones):
+    for j, tgt in enumerate(targets_list):
+        path = astar(start, tgt)
+        if path is not None:
+            cost_matrix[i, j] = len(path) - 1  # steps to reach
+        else:
+            # if unreachable, leave large cost (10^6)
+            cost_matrix[i, j] = 10**6
+
+# If a target is unreachable by both drones, we will drop it (can't deliver)
+reachable_mask = (cost_matrix.min(axis=0) < 10**6)
+unreachable_targets = [targets_list[k] for k, ok in enumerate(reachable_mask) if not ok]
+if unreachable_targets:
+    print("Warning: some targets unreachable by both drones; they will be ignored:", unreachable_targets)
+
+# filter to reachable targets
+reachable_indices = [k for k, ok in enumerate(reachable_mask) if ok]
+targets_list = [targets_list[k] for k in reachable_indices]
+cost_matrix = cost_matrix[:, reachable_indices]
+
+assignments = {0: set(), 1: set()}
+
+if ASSIGNMENT_MODE.lower() == "greedy":
+    # assign each target to nearest drone by cost
+    for j, tgt in enumerate(targets_list):
+        i = int(np.argmin(cost_matrix[:, j]))
+        assignments[i].add(tgt)
+elif ASSIGNMENT_MODE.lower() == "hungarian" and SCIPY_AVAILABLE:
+    # Hungarian algorithm minimizes total cost (global optimum for 1-to-1 assignment)
+    # But we have more targets than drones; we need a different framing:
+    # Hungarian solves n x n square assignment. Here we want to partition targets to two drones.
+    # Approach: build cost of assigning target j to drone i and solve by creating a 2xN cost array:
+    # We will simply use a greedy-balanced approach after ranking per-target best assign.
+    # Alternatively, we can build a 2N x 2N square cost matrix to enforce capacities — complex.
+    # Simpler pragmatic approach: solve as minimum-cost partition using linear programming is heavier.
+    # For hackathon: do per-target nearest (same as greedy) OR use balanced greedy: sort by difference.
+    # We'll implement a balanced greedy: sort targets by (cost_drone0 - cost_drone1) absolute and assign to minimize imbalance.
+    diffs = []
+    for j in range(len(targets_list)):
+        diffs.append((abs(cost_matrix[0,j] - cost_matrix[1,j]), j))
+    # sort by largest difference first (those are "obvious" assignments)
+    diffs.sort(reverse=True)
+    capacity = [len(targets_list)//2, len(targets_list) - len(targets_list)//2]  # try to balance counts
+    for _, j in diffs:
+        # prefer the drone with smaller cost, but don't exceed capacity
+        preferred = 0 if cost_matrix[0,j] <= cost_matrix[1,j] else 1
+        if len(assignments[preferred]) < capacity[preferred]:
+            assignments[preferred].add(targets_list[j])
+        else:
+            other = 1 - preferred
+            assignments[other].add(targets_list[j])
+else:
+    # fallback to greedy if SciPy not available or mode unknown
+    for j, tgt in enumerate(targets_list):
+        i = int(np.argmin(cost_matrix[:, j]))
+        assignments[i].add(tgt)
+
+# Quick counts
+print("Assignments counts:", {i: len(assignments[i]) for i in assignments})
+
+
+Note: Hungarian algorithm for many-to-one partitioning is more complex (requires capacity constraints). For clarity and robustness in a hackathon, we provided greedy and a practical balanced greedy inspired by Hungarian ideas. If you want a strict min-sum partition with capacities, I can add a linear-programming based solution (CVX/simple ILP) — say the word.
+
+Colab Cell 5 — Per-drone routing (greedy order + A*)
+
+Order each drone’s assigned deliveries using greedy nearest-neighbor and compute full A* path visiting each target.
+
+# Cell 5: per-drone route planning (greedy order + A* between waypoints)
+def plan_route_for_agent(start, tasks):
+    tasks = set(tasks)
+    order = []
+    cur = start
+    while tasks:
+        # choose nearest by Manhattan (fast) among remaining tasks
+        nearest = min(tasks, key=lambda t: manhattan(t, cur))
+        order.append(nearest)
+        tasks.remove(nearest)
+        cur = nearest
+    # connect waypoints with A*
+    waypoints = [start] + order
+    full_path = []
+    for i in range(len(waypoints)-1):
+        seg = astar(waypoints[i], waypoints[i+1])
+        if seg is None:
+            # in rare cases a previously reachable target may become unreachable via segments due to blocked constraints,
+            # but we already filtered unreachable. Raise error if it occurs.
+            raise RuntimeError(f"A* failed between {waypoints[i]} and {waypoints[i+1]}")
+        if i == 0:
+            full_path.extend(seg)
+        else:
+            full_path.extend(seg[1:])
+    return full_path, order
+
+plans = {}
+orders = {}
+for aid in range(2):
+    p, o = plan_route_for_agent(DRONE_STARTS[aid], assignments[aid])
+    plans[aid] = p
+    orders[aid] = o
+    print(f"Drone {aid}: assigned {len(assignments[aid])} tasks, path length {len(p)}")
+
+Colab Cell 6 — Simulation (step-by-step) & metrics
+
+Simulate both drones moving one cell per timestep. Compute makespan, total distance, efficiency, and produce coverage heatmap.
+
+# Cell 6: simulate drones moving along planned paths
+max_len = max(len(plans[0]), len(plans[1]))
+drone_positions = {0: DRONE_STARTS[0], 1: DRONE_STARTS[1]}
+delivered = set()
+positions_log = []
+delivered_log = []
+
+for t in range(max_len):
+    step_pos = {}
+    for aid in (0,1):
+        path = plans[aid]
+        if t < len(path):
+            drone_positions[aid] = path[t]
+        step_pos[aid] = drone_positions[aid]
+        # if drone is at a target, deliver
+        if drone_positions[aid] in targets:
+            delivered.add(drone_positions[aid])
+    positions_log.append(dict(step_pos))
+    delivered_log.append(set(delivered))
+
+# metrics
+total_delivered = len(delivered)
+makespan = max_len
+total_steps = sum(len(plans[aid]) for aid in plans)
+efficiency = total_delivered / total_steps if total_steps > 0 else 0.0
+
+metrics = {
+    "grid_size": (rows, cols),
+    "num_targets_initial": len(targets),
+    "num_reachable_targets": len(targets),
+    "delivered": total_delivered,
+    "makespan_timesteps": makespan,
+    "total_steps_traveled": total_steps,
+    "efficiency_delivered_per_step": efficiency
+}
+
+pd.DataFrame(list(metrics.items()), columns=["metric","value"])
+
+Colab Cell 7 — Static visualization: targets, planned paths, and coverage heatmap
+
+Plot three panels: initial targets and starts, planned routes, and final coverage heatmap (how many times a cell was flown over).
+
+# Cell 7: static visualization and coverage heatmap
+# Build coverage grid (counts of times any drone visited a cell)
+coverage = np.zeros((rows, cols), dtype=int)
+for frame in positions_log:
+    for aid in frame:
+        coverage[frame[aid]] += 1
+
+# panel 1: initial targets + starts + blocked
+init = np.zeros((rows, cols), dtype=int)
+for b in blocked:
+    init[b] = 1  # blocked = 1
+for tgt in targets:
+    init[tgt] = 2  # target = 2
+for i, s in enumerate(DRONE_STARTS):
+    init[s] = 3 + i  # starts 3 and 4
+
+# panel 2: planned paths overlay
+paths_grid = np.copy(init)
+for aid in plans:
+    for p in plans[aid]:
+        if paths_grid[p] == 0:
+            paths_grid[p] = 5 + aid  # path markers 5/6
+
+# plot
+if VISUALIZE:
+    fig, axes = plt.subplots(1,3, figsize=(18,6))
+    axes[0].imshow(init)
+    axes[0].set_title("Initial: blocked (1), targets (2), starts (3/4)")
+    axes[0].axis('off')
+
+    axes[1].imshow(paths_grid)
+    axes[1].set_title("Planned paths overlay (5/6)")
+    axes[1].axis('off')
+
+    im = axes[2].imshow(coverage, cmap='hot')
+    axes[2].set_title("Coverage heatmap (flight frequency)")
+    axes[2].axis('off')
+    fig.colorbar(im, ax=axes[2], fraction=0.046, pad=0.04)
+
+    plt.tight_layout()
+    plt.show()
+
+Colab Cell 8 — Optional animation of deliveries
+
+Animated view of both drones flying and delivering packages (great for demo). It shows current drone positions and delivered targets.
+
+# Cell 8: animation of drone movement and deliveries
+if MAKE_ANIMATION and len(positions_log) > 0:
+    base = np.zeros((rows, cols), dtype=int)
+    for b in blocked:
+        base[b] = 1
+    for tgt in targets:
+        base[tgt] = 2
+
+    fig, ax = plt.subplots(figsize=(6,6))
+    im = ax.imshow(base, vmin=0, vmax=8)
+    ax.axis('off')
+
+    def update(frame):
+        grid = base.copy()
+        # mark delivered up to this frame
+        for d in delivered_log[frame]:
+            grid[d] = 7  # delivered marker
+        # place drones
+        for aid in (0,1):
+            pos = positions_log[frame][aid]
+            grid[pos] = 3 + aid  # drone markers
+        im.set_data(grid)
+        ax.set_title(f"Step {frame+1}/{len(positions_log)}  Delivered: {len(delivered_log[frame])}")
+        return (im,)
+
+    ani = animation.FuncAnimation(fig, update, frames=len(positions_log), interval=150, blit=False)
+    plt.close(fig)
+    display(HTML(ani.to_jshtml()))
+else:
+    print("Animation skipped or no steps.")
+
+Colab Cell 9 — Route & summary printouts for demo
+
+Print per-drone assigned targets, order, and path length.
+
+# Cell 9: print summaries for demo
+print("\n--- SUMMARY ---")
+for aid in (0,1):
+    print(f"Drone {aid} start: {DRONE_STARTS[aid]}")
+    print(f"  assigned targets: {len(assignments[aid])}")
+    print(f"  visit order (first 8): {orders[aid][:8]}")
+    print(f"  path length: {len(plans[aid])}\n")
+
+print("Global metrics:")
+display(pd.DataFrame(list(metrics.items()), columns=["metric","value"]))
